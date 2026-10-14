@@ -224,9 +224,12 @@ EIXO_ALIASES: Dict[str, str] = {
 }
 
 # Lista flat de todos os produtos (canônicos + legados)
-ALL_PRODUTOS = [p for prods in CANONICAL_PRODUTOS.values() for p in prods]
-ALL_PRODUTOS += [p for prods in LEGACY_PRODUTOS.values() for p in prods]
-
+ALL_PRODUTOS = []
+for prods in CANONICAL_PRODUTOS.values():
+    ALL_PRODUTOS.extend(prods)
+for prods in LEGACY_PRODUTOS.values():
+    ALL_PRODUTOS.extend(prods)
+    
 # Mapa reverso: produto → eixo canônico (canônicos + legados)
 PRODUTO_TO_EIXO = {}
 for eixo, prods in CANONICAL_PRODUTOS.items():
