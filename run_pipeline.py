@@ -5,6 +5,10 @@ Reproduz o notebook: exec sequencial de notebook_cells/*.py num namespace
 compartilhado — a mesma semântica que o Jupyter dá às células. Saídas em
 ./ptd_output/ (mesmo layout do 01_setup local).
 
+Com --run-local, executa o pipeline offline utilizando exclusivamente os PDFs
+já baixados disponíveis na pasta corpus_pdfs/ (diretivo/ e entregas/),
+dispensando scraping web e download.
+
 Com --sync, substitui output/ do repo pelo resultado do run e regenera os
 derivados (build_coverage.py → coverage_summary.csv; build_metadata.py →
 datapackage/metadata; build_corpus.py → harmonized/; build_xlsx.py →
@@ -25,6 +29,7 @@ import traceback
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 CELLS_DIR = os.path.join(REPO_ROOT, "notebook_cells")
+CORPUS_DIR = os.path.join(REPO_ROOT, "corpus_pdfs")
 RUN_OUTPUT = os.path.join(REPO_ROOT, "ptd_output", "output")
 REPO_OUTPUT = os.path.join(REPO_ROOT, "output")
 
@@ -40,6 +45,79 @@ PREFLIGHT_AFTER = "03_utils.py"
 # devolvendo metade do corpus passaria neles. Pisos ≈75-80% do baseline
 # 2026-05 (91 órgãos / 4574 entregas / 619 riscos).
 FLOORS = {"orgaos": 80, "entregas": 3500, "riscos": 450}
+
+
+def load_local_organs(ns: dict) -> list:
+    """Popula all_organs usando arquivos locais em corpus_pdfs/ e output/organs.csv.
+
+    Dispensa requisições HTTP e vincula diretamente os caminhos de diretivo e entregas.
+    """
+    import csv
+    OrganInfo = ns["OrganInfo"]
+    member_to_group = ns.get("MEMBER_TO_GROUP", {})
+
+    manifest_path = os.path.join(CORPUS_DIR, "manifest.json")
+    manifest_orgaos = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest_orgaos = json.load(f).get("orgaos", {})
+        except Exception as exc:
+            print(f"Aviso ao carregar {manifest_path}: {exc}")
+
+    organs_csv = os.path.join(REPO_OUTPUT, "organs.csv")
+    rows = []
+    if os.path.exists(organs_csv):
+        with open(organs_csv, encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+    else:
+        for sigla, info in manifest_orgaos.items():
+            rows.append({
+                "sigla": sigla,
+                "nome_completo": f"Plano de Transformação Digital {sigla}",
+                "grupo": member_to_group.get(sigla, ""),
+                "url_diretivo": info.get("url_original", ""),
+                "url_entregas": "",
+            })
+
+    organs = []
+    dir_base = os.path.join(CORPUS_DIR, "diretivo")
+    ent_base = os.path.join(CORPUS_DIR, "entregas")
+
+    for r in sorted(rows, key=lambda x: x["sigla"]):
+        sigla = r["sigla"]
+
+        # 1. Documento Diretivo
+        m_info = manifest_orgaos.get(sigla, {})
+        rel_file = m_info.get("file")
+        if rel_file:
+            dir_path = os.path.join(CORPUS_DIR, rel_file)
+        else:
+            dir_path = os.path.join(dir_base, f"{sigla}_diretivo.pdf")
+        pdf_dir = (os.path.abspath(dir_path)
+                   if (os.path.exists(dir_path) and os.path.getsize(dir_path) > 1000)
+                   else None)
+
+        # 2. Anexo de Entregas
+        ent_path = os.path.join(ent_base, f"{sigla}_entregas.pdf")
+        pdf_ent = (os.path.abspath(ent_path)
+                   if (os.path.exists(ent_path) and os.path.getsize(ent_path) > 1000)
+                   else None)
+
+        organs.append(OrganInfo(
+            sigla=sigla,
+            nome_completo=r.get("nome_completo") or f"Plano de Transformação Digital {sigla}",
+            grupo=r.get("grupo") or member_to_group.get(sigla),
+            url_diretivo=r.get("url_diretivo") or m_info.get("url_original"),
+            url_entregas=r.get("url_entregas") or None,
+            pdf_path_diretivo=pdf_dir,
+            pdf_path_entregas=pdf_ent,
+        ))
+
+    n_dir = sum(1 for o in organs if o.pdf_path_diretivo)
+    n_ent = sum(1 for o in organs if o.pdf_path_entregas)
+    print(f"RUN-LOCAL: {len(organs)} órgãos carregados localmente ({n_dir} diretivos, {n_ent} entregas vinculados).")
+    return organs
 
 
 def preflight(ns: dict) -> None:
@@ -67,17 +145,33 @@ def preflight(ns: dict) -> None:
     print(f"PREFLIGHT ok: HTTP {code} em {url}")
 
 
-def run_cells(skip_preflight: bool) -> None:
+def run_cells(skip_preflight: bool, run_local: bool = False) -> None:
     # Cells no namespace REAL de __main__ — mesma semântica do Jupyter e, crucial
     # para os checkpoints: pickle.dump de dataclasses (RiskEntry/DeliveryEntry/…)
     # só resolve a classe se ela viver em sys.modules["__main__"]; um dict avulso
     # com __name__="__main__" faz o pickle falhar (lookup em __main__ vazio).
     import __main__
     ns = __main__.__dict__
+    if run_local:
+        skip_preflight = True
+        ns["RUN_LOCAL"] = True
+
     for path in sorted(glob.glob(os.path.join(CELLS_DIR, "*.py"))):
         name = os.path.basename(path)
         t0 = time.time()
         print(f"\n{'=' * 70}\n=== CELL {name}\n{'=' * 70}", flush=True)
+
+        if run_local and name == "04b_scraping.py":
+            print("RUN-LOCAL: Substituindo scraping web pelo carregamento local de órgãos...")
+            ns["all_organs"] = load_local_organs(ns)
+            print(f"--- {name} (local) ok em {time.time() - t0:.1f}s", flush=True)
+            continue
+
+        if run_local and name == "05b_download.py":
+            print("RUN-LOCAL: Download web pulado (PDFs locais de corpus_pdfs já vinculados).")
+            print(f"--- {name} (local) ok em {time.time() - t0:.1f}s", flush=True)
+            continue
+
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
         try:
@@ -163,11 +257,17 @@ def main(argv=None) -> int:
                          "datapackage/metadata/harmonized + PTD-corpus.xlsx.")
     ap.add_argument("--skip-preflight", action="store_true",
                     help="Não testa o portal SGD antes do scraping.")
+    ap.add_argument("--run-local", action="store_true",
+                    help="Executa o pipeline offline utilizando exclusivamente "
+                         "os PDFs e metadados já disponíveis em corpus_pdfs/.")
     args = ap.parse_args(argv)
+
+    if args.run_local:
+        args.skip_preflight = True
 
     os.chdir(REPO_ROOT)   # 01_setup deriva BASE_DIR de os.getcwd()
     t0 = time.time()
-    run_cells(args.skip_preflight)
+    run_cells(args.skip_preflight, run_local=args.run_local)
     quality_gate()
     if args.sync:
         sync_repo()
